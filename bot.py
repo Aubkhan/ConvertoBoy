@@ -39,56 +39,120 @@ def extract_text(data: bytes, suffix: str) -> str:
         if not result.strip():
             raise ValueError('Это PDF-скан без текстового слоя. OCR пока не поддерживается.')
         return result
-    if suffix == '.xlsx':
-        from openpyxl import load_workbook
-        wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-        lines = []
-        for ws in wb.worksheets:
-            for row in ws.iter_rows(values_only=True):
-                values = [str(v).strip() for v in row if v is not None and str(v).strip()]
-                if values:
-                    lines.extend(values)
-        wb.close()
-        return '\n'.join(lines)
     raise ValueError('Поддерживаются TXT, MD, CSV, TSV, DOCX, PDF (текстовый) и XLSX')
 
 
-def parse_excel_table(data: bytes):
-    """Recognize question/answer columns, preserving answer keys from header labels."""
+def normalize_excel_header(value) -> str:
+    header = str(value or '').strip().casefold()
+    for apostrophe in ('’', '‘', 'ʻ', 'ʼ', '`', '´'):
+        header = header.replace(apostrophe, "'")
+    header = re.sub(r'[_\-/]+', ' ', header)
+    return re.sub(r'\s+', ' ', header)
+
+
+def is_question_header(header: str) -> bool:
+    return any(term in header for term in ('вопрос', 'savol', 'савол', 'question'))
+
+
+def excel_answer_kind(header: str):
+    if any(term in header for term in (
+        'неправильн', 'неверн', 'ошибочн', 'noto\'g\'ri', 'notogri', 'нотўғри',
+        'incorrect', 'wrong answer', 'wrong option', 'distractor',
+    )):
+        return 'wrong'
+    if any(term in header for term in (
+        'правильн', 'верн', 'to\'g\'ri', 'togri', 'тўғри', 'тугри', 'correct answer', 'correct',
+    )):
+        return 'correct'
+    if any(term in header for term in (
+        'ответ', 'javob', 'жавоб', 'answer', 'вариант', 'variant', 'option', 'choice',
+    )):
+        return 'answer'
+    if re.fullmatch(r'[a-h]', header):
+        return 'answer'
+    return None
+
+
+def read_excel_tables(data: bytes):
+    """Read question/answer table layouts from all worksheets."""
     from openpyxl import load_workbook
     wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-    all_questions = []
+    tables = []
     try:
         for ws in wb.worksheets:
-            rows = ws.iter_rows(values_only=True)
-            try:
-                header = next(rows)
-            except StopIteration:
+            values = list(ws.iter_rows(values_only=True))
+            header_row = None
+            for row_index, row in enumerate(values):
+                normalized_row = [normalize_excel_header(value) for value in row]
+                question_headers = [
+                    i for i, header in enumerate(normalized_row) if is_question_header(header)
+                ]
+                answer_headers = [
+                    i for i, header in enumerate(normalized_row)
+                    if i not in question_headers and excel_answer_kind(header)
+                ]
+                if question_headers and len(answer_headers) >= 2:
+                    header_row = row_index
+                    break
+            if header_row is None:
                 continue
-            def norm(v):
-                return re.sub(r'\s+', ' ', str(v or '').strip().lower()).replace('’', "'").replace('`', "'")
-            heads = [norm(v) for v in header]
-            def is_question(h):
-                return ('вопрос' in h or 'savol' in h or 'question' in h)
-            def is_correct(h):
-                return ('правильн' in h and 'неправильн' not in h) or ('to\'g\'ri' in h and 'noto' not in h) or 'correct answer' in h
-            def is_wrong(h):
-                return 'неправильн' in h or 'noto' in h or 'incorrect' in h or 'wrong answer' in h
-            qidx = next((i for i,h in enumerate(heads) if is_question(h)), None)
-            good = [i for i,h in enumerate(heads) if is_correct(h)]
-            bad = [i for i,h in enumerate(heads) if is_wrong(h)]
-            if qidx is None or not good or not bad:
+            headers = [str(value).strip() if value is not None else '' for value in values[header_row]]
+            normalized = [normalize_excel_header(value) for value in headers]
+            question_index = next(i for i, header in enumerate(normalized) if is_question_header(header))
+            answer_indices = [
+                i for i, header in enumerate(normalized)
+                if i != question_index and excel_answer_kind(header)
+            ]
+            if len(answer_indices) < 2:
                 continue
-            for row in rows:
-                def val(i):
-                    return str(row[i]).strip() if i < len(row) and row[i] is not None else ''
-                question = val(qidx)
-                answers = [('+', val(i)) for i in good if val(i)] + [('-', val(i)) for i in bad if val(i)]
-                if question and len(answers) >= 2:
-                    all_questions.append({'q': question, 'a': answers})
+            tables.append({
+                'sheet': ws.title,
+                'headers': headers,
+                'question_index': question_index,
+                'answer_indices': answer_indices,
+                'correct_indices': [i for i in answer_indices if excel_answer_kind(normalized[i]) == 'correct'],
+                'rows': values[header_row + 1:],
+            })
     finally:
         wb.close()
-    return all_questions
+    return tables
+
+
+def questions_from_excel_table(table, correct_index: int):
+    questions = []
+    question_index = table['question_index']
+    for row in table['rows']:
+        normalized_row = [normalize_excel_header(value) for value in row]
+        if (
+            any(is_question_header(value) for value in normalized_row)
+            and sum(bool(excel_answer_kind(value)) for value in normalized_row) >= 2
+        ):
+            continue
+        def value_at(index):
+            if index >= len(row) or row[index] is None:
+                return ''
+            return str(row[index]).strip()
+
+        question = value_at(question_index)
+        answers = [
+            ('+' if index == correct_index else '-', value_at(index))
+            for index in table['answer_indices']
+            if value_at(index)
+        ]
+        if question and len(answers) >= 2:
+            questions.append({'q': question, 'a': answers})
+    return questions
+
+
+def excel_table_correct_index(table):
+    correct_indices = table['correct_indices']
+    return correct_indices[0] if len(correct_indices) == 1 else None
+
+
+def excel_table_candidates(table):
+    if len(table['correct_indices']) > 1:
+        return table['correct_indices']
+    return table['answer_indices']
 
 def parse_questions(text: str):
     questions = []
@@ -150,7 +214,33 @@ def convert(questions, mode: str) -> str:
     return '\n'.join(out).strip() + '\n'
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Привет! Я ConvertoBoy 🤖\nПришли файл с тестами (TXT, DOCX, PDF, XLSX, CSV, TSV или MD). Я преобразую вопросы в TXT для «Ассистента».\n\nВажно: если правильные ответы не отмечены, я предложу выбрать правило, а не буду их угадывать.')
+    await update.message.reply_text('Привет! Я ConvertoBoy 🤖\nПришли файл с тестами (TXT, DOCX, PDF, XLSX, CSV, TSV или MD). Я преобразую вопросы в TXT для «Ассистента».\n\nВажно: в Excel правильный ответ определяется по заголовку столбца; если это неясно, я попрошу выбрать столбец. Для остальных файлов предложу выбрать правило, если правильные ответы не отмечены.')
+
+
+def excel_selection_keyboard(table):
+    candidates = excel_table_candidates(table)
+    buttons = [
+        InlineKeyboardButton(
+            table['headers'][index][:64],
+            callback_data=f'excel:select:{candidate_index}',
+        )
+        for candidate_index, index in enumerate(candidates)
+    ]
+    return InlineKeyboardMarkup([[button] for button in buttons])
+
+
+async def deliver_excel(message, questions, filename, status_message):
+    result = convert(questions, 'marks')
+    output_name = filename + '_Assistant.txt'
+    bio = io.BytesIO(result.encode('utf-8-sig'))
+    bio.name = output_name
+    await message.reply_document(
+        document=bio,
+        filename=output_name,
+        caption=f'Готово: {len(questions)} вопросов. Проверь правильность ответов перед импортом.',
+    )
+    await status_message.edit_text('Файл готов ✅ Отправь новый документ, чтобы конвертировать ещё один.')
+
 
 async def document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
@@ -165,12 +255,47 @@ async def document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         tgfile = await doc.get_file()
         data = bytes(await tgfile.download_as_bytearray())
-        questions = await asyncio.to_thread(parse_excel_table, data) if suffix == '.xlsx' else []
-        if not questions:
+        if suffix == '.xlsx':
+            tables = await asyncio.to_thread(read_excel_tables, data)
+            if not tables:
+                raise ValueError(
+                    'Не нашёл таблиц с заголовками вопроса и как минимум двух столбцов ответов. '
+                    'Используй заголовки «Вопрос», «Правильный ответ», «Неправильный ответ» '
+                    'или их аналоги.'
+                )
+            questions = []
+            pending = []
+            for table in tables:
+                correct_index = excel_table_correct_index(table)
+                if correct_index is None:
+                    pending.append(table)
+                else:
+                    questions.extend(questions_from_excel_table(table, correct_index))
+            context.user_data['excel_questions'] = questions
+            context.user_data['excel_pending'] = pending
+            context.user_data['filename'] = Path(doc.file_name or 'tests').stem
+            if pending:
+                table = pending[0]
+                await msg.edit_text(
+                    f"На листе «{table['sheet']}» не удалось однозначно определить правильный ответ. "
+                    'Выбери столбец правильного ответа:',
+                    reply_markup=excel_selection_keyboard(table),
+                )
+                return
+            if not questions:
+                raise ValueError('В таблицах не найдено строк с вопросом и как минимум двумя ответами.')
+            await deliver_excel(
+                update.message,
+                questions,
+                context.user_data['filename'],
+                msg,
+            )
+            return
+        else:
             text = await asyncio.to_thread(extract_text, data, suffix)
             questions = parse_questions(text)
         if not questions:
-            raise ValueError('Не нашёл вопросы с вариантами. Для Excel нужны заголовки «Вопрос», «Правильный ответ», «Неправильный ответ» (или их аналоги). Для текстовых файлов — нумерация или #.')
+            raise ValueError('Не нашёл вопросы с вариантами. Для текстовых файлов используй нумерацию или #.')
         context.user_data['questions'] = questions
         context.user_data['filename'] = Path(doc.file_name or 'tests').stem
         await msg.edit_text(f'Нашёл вопросов: {len(questions)}.\nКак определить правильные ответы?', reply_markup=InlineKeyboardMarkup([
@@ -184,6 +309,44 @@ async def document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if query.data.startswith('excel:select:'):
+        pending = context.user_data.get('excel_pending', [])
+        if not pending:
+            await query.edit_message_text('Отправь Excel-файл ещё раз: предыдущие данные недоступны.')
+            return
+        table = pending.pop(0)
+        candidates = excel_table_candidates(table)
+        try:
+            candidate_index = int(query.data.rsplit(':', 1)[1])
+            correct_index = candidates[candidate_index]
+        except (ValueError, IndexError):
+            await query.edit_message_text('Не удалось определить выбранный столбец. Отправь Excel-файл ещё раз.')
+            return
+        questions = context.user_data.setdefault('excel_questions', [])
+        questions.extend(questions_from_excel_table(table, correct_index))
+        if pending:
+            next_table = pending[0]
+            await query.edit_message_text(
+                f"На листе «{next_table['sheet']}» не удалось однозначно определить правильный ответ. "
+                'Выбери столбец правильного ответа:',
+                reply_markup=excel_selection_keyboard(next_table),
+            )
+            return
+        if not questions:
+            await query.edit_message_text('В таблицах не найдено строк с вопросом и как минимум двумя ответами.')
+            return
+        try:
+            await deliver_excel(
+                query.message,
+                questions,
+                context.user_data.get('filename', 'tests'),
+                query.message,
+            )
+        except Exception as exc:
+            logging.exception('Excel conversion error')
+            await query.message.reply_text(f'Не удалось обработать файл: {exc}')
+        return
+
     questions = context.user_data.get('questions')
     if not questions:
         await query.edit_message_text('Отправь файл ещё раз: предыдущие данные недоступны.')
@@ -205,7 +368,7 @@ def main():
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler('start', start))
     app.add_handler(MessageHandler(filters.Document.ALL, document))
-    app.add_handler(CallbackQueryHandler(choose, pattern='^(marks|first)$'))
+    app.add_handler(CallbackQueryHandler(choose, pattern='^(marks|first|excel:select:\\d+)$'))
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
