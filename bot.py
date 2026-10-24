@@ -97,6 +97,13 @@ def parse_questions(text: str):
         line = raw.strip()
         if not line:
             continue
+
+        if current is not None:
+            choice = CHOICE.match(line)
+            if choice:
+                current['a'].append(('', choice.group(3).strip()))
+                continue
+
         header = HEADER.match(line)
         if line.startswith('# '):
             header_text = line[2:].strip()
@@ -104,20 +111,27 @@ def parse_questions(text: str):
             header_text = header.group(3).strip()
         else:
             header_text = None
+
         if header_text is not None:
             if current:
                 questions.append(current)
             current = {'q': header_text, 'a': []}
             continue
+
         if current is None:
             continue
+
         if line.startswith(('+ ', '- ', '* ')):
             mark, answer = line[0], line[2:].strip()
         else:
             choice = CHOICE.match(line)
-            mark, answer = '', choice.group(3).strip() if choice else line
+            if choice:
+                mark, answer = '', choice.group(3).strip()
+            else:
+                mark, answer = '', line
         if answer:
             current['a'].append((mark, answer))
+
     if current:
         questions.append(current)
     return [q for q in questions if len(q['a']) >= 2]
