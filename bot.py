@@ -365,7 +365,16 @@ def main():
     token = os.getenv('BOT_TOKEN')
     if not token:
         raise RuntimeError('Укажи BOT_TOKEN в переменных окружения. Не публикуй токен.')
-    app = Application.builder().token(token).build()
+    
+    app = (
+        Application.builder()
+        .token(token)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .build()
+    )
+
     app.add_handler(CommandHandler('start', start))
     app.add_handler(MessageHandler(filters.Document.ALL, document))
     app.add_handler(CallbackQueryHandler(choose, pattern='^(marks|first|excel:select:\\d+)$'))
