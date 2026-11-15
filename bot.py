@@ -369,7 +369,19 @@ def main():
     app.add_handler(CommandHandler('start', start))
     app.add_handler(MessageHandler(filters.Document.ALL, document))
     app.add_handler(CallbackQueryHandler(choose, pattern='^(marks|first|excel:select:\\d+)$'))
-    app.run_polling(drop_pending_updates=True)
+    
+    base_url = os.environ["RENDER_EXTERNAL_URL"].rstrip("/")
+    port = int(os.environ.get("PORT", "10000"))
+
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path="telegram",
+        webhook_url=f"{base_url}/telegram",
+        drop_pending_updates=False,
+        secret_token=os.environ["WEBHOOK_SECRET"],
+    )
+
 
 if __name__ == '__main__':
     main()
